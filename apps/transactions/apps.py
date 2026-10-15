@@ -1,0 +1,7 @@
+from django.apps import AppConfig
+
+
+class TransactionsConfig(AppConfig):
+    name = "apps.transactions"
+    label = "transactions"
+    verbose_name = "Transactions et paiements"

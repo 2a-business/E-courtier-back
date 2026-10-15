@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+media/
+private_media/
+staticfiles/
+.test_media/
+.test_private_media/
+.coverage
+htmlcov/
+.pytest_cache/
