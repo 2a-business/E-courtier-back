@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "drf_spectacular",
     "apps.accounts",
+    "apps.media",
     "apps.moderation",
     "apps.notifications",
     "apps.listings",
@@ -62,6 +63,7 @@ INSTALLED_APPS = [
     "apps.search",
     "apps.assistant",
     "apps.visits",
+    "apps.applications",
     "apps.transactions",
     "apps.contracts",
     "apps.reviews",
@@ -123,9 +125,20 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = env("MEDIA_URL", "/media/")
-MEDIA_ROOT = Path(env("MEDIA_ROOT", str(BASE_DIR / "media")))
+# Volume persistant Railway monté sur /app/media (= BASE_DIR / "media", l'emplacement historique) : Railway fournit
+# RAILWAY_VOLUME_MOUNT_PATH. Photos à la racine du volume (listings/<annonce>/<uuid>.jpg), justificatifs dans
+# <volume>/private pour être eux aussi persistés (un seul volume par service). Seul le sous-dossier listings/ est
+# diffusé publiquement (apps/media/views.py). MEDIA_ROOT / PRIVATE_MEDIA_ROOT explicites restent prioritaires.
+VOLUME_ROOT = env("RAILWAY_VOLUME_MOUNT_PATH") or None
+MEDIA_ROOT = Path(env("MEDIA_ROOT") or VOLUME_ROOT or BASE_DIR / "media")
 # Justificatifs : stockage séparé, jamais exposé par une URL publique.
-PRIVATE_MEDIA_ROOT = Path(env("PRIVATE_MEDIA_ROOT", str(BASE_DIR / "private_media")))
+PRIVATE_MEDIA_ROOT = Path(
+    env("PRIVATE_MEDIA_ROOT") or (Path(VOLUME_ROOT) / "private" if VOLUME_ROOT else BASE_DIR / "private_media")
+)
+# Sous-dossiers de MEDIA_ROOT diffusables sans authentification (liste blanche).
+PUBLIC_MEDIA_PREFIXES = ("listings",)
+# Durée de cache navigateur/CDN des photos publiques : les noms de fichiers sont uniques (uuid) et jamais réécrits.
+MEDIA_CACHE_SECONDS = env_int("MEDIA_CACHE_SECONDS", 60 * 60 * 24 * 365)
 
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
@@ -239,6 +252,9 @@ SPECTACULAR_SETTINGS = {
         "PublicationStatusEnum": "apps.listings.models.PublicationStatus",
         "ReviewStatusEnum": "apps.reviews.models.ReviewStatus",
         "AttemptStatusEnum": "apps.transactions.models.AttemptStatus",
+        "ApplicationStatusEnum": "apps.applications.models.ApplicationStatus",
+        "ApplicationDocumentTypeEnum": "apps.applications.models.ApplicationDocumentType",
+        "VerificationDocumentTypeEnum": "apps.verification.models.DocumentType",
     },
 }
 
@@ -251,11 +267,23 @@ EMAIL_PORT = env_int("EMAIL_PORT", 587)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
+# Sans délai, une connexion SMTP bloquée immobiliserait un worker gunicorn indéfiniment.
+EMAIL_TIMEOUT = env_int("EMAIL_TIMEOUT", 10)
+# Faux en production tant qu'aucun serveur SMTP n'est configuré (voir prod.py) : les envois sont alors refusés
+# explicitement au lieu d'être perdus.
+EMAIL_ENABLED = True
 
 # --- Règles métier configurables -------------------------------------------------
 CURRENCY = "XOF"
 DOSSIER_FEE_XOF = env_int("DOSSIER_FEE_XOF", 5000)
 SALE_DEPOSIT_PERCENT = env_int("SALE_DEPOSIT_PERCENT", 10)
+
+# --- Dossier locatif -------------------------------------------------------------
+# Pièces obligatoires avant transmission : groupes séparés par des virgules, alternatives par « | ».
+# Défaut : une pièce d'identité (CNI ou passeport). Ex. « ID_CARD|PASSPORT,INCOME_PROOF|EMPLOYMENT_PROOF ».
+RENTAL_APPLICATION_REQUIRED_DOCS = [set(group.split("|")) for group in env_list("RENTAL_APPLICATION_REQUIRED_DOCS", "ID_CARD|PASSPORT")]
+MAX_APPLICATION_DOCUMENTS = env_int("MAX_APPLICATION_DOCUMENTS", 15)
 
 # --- Paiement -------------------------------------------------------------------
 # Lien de paiement Wave Business (marchand). Le client y saisit le montant puis confirme dans son appli.
@@ -282,12 +310,17 @@ ASSISTANT_HISTORY_MESSAGES = env_int("ASSISTANT_HISTORY_MESSAGES", 4)
 ASSISTANT_MAX_MESSAGE_CHARS = env_int("ASSISTANT_MAX_MESSAGE_CHARS", 500)
 ASSISTANT_RESULTS_LIMIT = env_int("ASSISTANT_RESULTS_LIMIT", 6)
 
+# Railway classe en erreur tout ce qui sort sur stderr : INFO → stdout, WARNING et plus → stderr.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {"below_warning": {"()": "config.log_filters.MaxLevelFilter", "level": "WARNING"}},
     "formatters": {"plain": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"}},
-    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
-    "root": {"handlers": ["console"], "level": env("LOG_LEVEL", "INFO")},
+    "handlers": {
+        "stdout": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout", "formatter": "plain", "filters": ["below_warning"]},
+        "stderr": {"class": "logging.StreamHandler", "stream": "ext://sys.stderr", "formatter": "plain", "level": "WARNING"},
+    },
+    "root": {"handlers": ["stdout", "stderr"], "level": env("LOG_LEVEL", "INFO")},
     "loggers": {"django.request": {"level": "WARNING"}},
 }
 LLM_GEMINI_DISABLE_THINKING = env_bool("LLM_GEMINI_DISABLE_THINKING", True)

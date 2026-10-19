@@ -113,10 +113,26 @@ def start_wave_payment(*, customer, tx: Transaction) -> tuple[PaymentAttempt, di
         raise Forbidden("Ce dossier ne vous appartient pas.")
     if tx.status != TransactionStatus.PENDING:
         raise InvalidTransition("Ce dossier n'est plus en attente de paiement.")
+    # Lève payment_not_configured (503) avant toute écriture si aucun lien marchand n'est configuré.
     checkout = get_provider().start(tx)
-    attempt = PaymentAttempt.objects.create(transaction=tx, provider=Provider.WAVE_LINK, checkout_url=checkout.url)
-    _event(tx, "payment_started", actor=customer, note="Redirection vers Wave Business")
+    # Idempotent : un nouveau clic (ou « Rouvrir Wave ») réutilise la tentative ouverte au lieu d'en empiler.
+    attempt = _open_wave_attempt(tx)
+    if attempt is None:
+        attempt = PaymentAttempt.objects.create(transaction=tx, provider=Provider.WAVE_LINK, checkout_url=checkout.url)
+        _event(tx, "payment_started", actor=customer, note="Redirection vers Wave Business")
+    elif attempt.checkout_url != checkout.url:
+        attempt.checkout_url = checkout.url
+        attempt.save(update_fields=["checkout_url"])
     return attempt, {"url": checkout.url, "instructions": checkout.instructions, "auto_confirmation": checkout.auto_confirmation}
+
+
+def _open_wave_attempt(tx: Transaction) -> PaymentAttempt | None:
+    """Dernière tentative Wave démarrée et non clôturée (redirigée ou déclarée par le client)."""
+    return (
+        tx.attempts.filter(provider=Provider.WAVE_LINK, status__in=[AttemptStatus.INITIATED, AttemptStatus.CUSTOMER_DECLARED])
+        .order_by("-created_at")
+        .first()
+    )
 
 
 @transaction.atomic
@@ -130,9 +146,14 @@ def declare_payment(*, customer, tx: Transaction, provider_reference: str) -> Pa
     reference = provider_reference.strip().upper()
     if PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exclude(transaction=tx).exists():
         raise Conflict("Cette référence Wave est déjà associée à un autre dossier.", code="duplicate_reference")
-    attempt = tx.attempts.filter(provider=Provider.WAVE_LINK, status=AttemptStatus.INITIATED).first()
+    # Une déclaration n'est possible qu'après une redirection réelle vers Wave (lien marchand configuré).
+    # Une seconde déclaration corrige la référence de la même tentative ; le statut reste PENDING.
+    attempt = _open_wave_attempt(tx)
     if attempt is None:
-        attempt = PaymentAttempt(transaction=tx, provider=Provider.WAVE_LINK)
+        raise BusinessError(
+            "Démarrez d'abord le paiement avec Wave : aucune redirection vers Wave n'a été enregistrée pour ce dossier.",
+            code="payment_not_started", http_status=409,
+        )
     attempt.provider_reference = reference
     attempt.status = AttemptStatus.CUSTOMER_DECLARED
     attempt.declared_at = timezone.now()

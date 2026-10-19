@@ -2,7 +2,7 @@ import pytest
 from django.test import override_settings
 
 from apps.contracts.models import Contract
-from apps.transactions.models import Transaction
+from apps.transactions.models import PaymentAttempt, Transaction, TransactionEvent
 from apps.visits import services as visit_services
 from conftest import client_for, make_listing, make_slot, make_user
 
@@ -54,6 +54,59 @@ def test_wave_not_configured_returns_503(visited, customer):
     with override_settings(WAVE_PAYMENT_LINK=""):
         res = client_for(customer).post(f"/api/v1/transactions/{tx['id']}/wave/")
     assert res.status_code == 503 and res.data["code"] == "payment_not_configured"
+
+
+def test_wave_not_configured_creates_nothing_and_blocks_declaration(visited, customer):
+    tx = create(customer, visited).data
+    c = client_for(customer)
+    with override_settings(WAVE_PAYMENT_LINK=""):
+        assert c.post(f"/api/v1/transactions/{tx['id']}/wave/").status_code == 503
+        res = c.post(f"/api/v1/transactions/{tx['id']}/declare/", {"provider_reference": "T_ABC123456"}, format="json")
+    assert res.status_code == 409 and res.data["code"] == "payment_not_started"
+    assert PaymentAttempt.objects.count() == 0
+    assert Transaction.objects.get(pk=tx["id"]).status == "PENDING"
+
+
+def test_declaration_requires_started_payment(visited, customer):
+    tx = create(customer, visited).data
+    res = client_for(customer).post(f"/api/v1/transactions/{tx['id']}/declare/", {"provider_reference": "T_ABC123456"}, format="json")
+    assert res.status_code == 409 and res.data["code"] == "payment_not_started"
+    assert PaymentAttempt.objects.count() == 0
+
+
+def test_repeated_start_and_declaration_reuse_the_same_attempt(visited, customer):
+    tx = create(customer, visited).data
+    c = client_for(customer)
+    first = c.post(f"/api/v1/transactions/{tx['id']}/wave/").data["attempt"]["id"]
+    assert c.post(f"/api/v1/transactions/{tx['id']}/wave/").data["attempt"]["id"] == first
+    c.post(f"/api/v1/transactions/{tx['id']}/declare/", {"provider_reference": "T_ERREUR0001"}, format="json")
+    # Rouvrir Wave puis corriger la référence : toujours une seule tentative, toujours PENDING.
+    assert c.post(f"/api/v1/transactions/{tx['id']}/wave/").data["attempt"]["id"] == first
+    res = c.post(f"/api/v1/transactions/{tx['id']}/declare/", {"provider_reference": "T_BONNE00002"}, format="json")
+    assert res.status_code == 200 and res.data["status"] == "PENDING"
+    attempts = PaymentAttempt.objects.filter(transaction_id=tx["id"])
+    assert attempts.count() == 1 and attempts.get().provider_reference == "T_BONNE00002"
+    events = list(TransactionEvent.objects.filter(transaction_id=tx["id"]).values_list("event", flat=True))
+    assert events.count("payment_started") == 1
+
+
+def test_payment_start_refused_for_others_and_closed_dossiers(visited, customer, admin):
+    tx = create(customer, visited).data
+    stranger = make_user()
+    assert client_for(stranger).post(f"/api/v1/transactions/{tx['id']}/wave/").status_code == 403
+    assert client_for(visited.owner).post(f"/api/v1/transactions/{tx['id']}/wave/").status_code == 403
+    client_for(customer).post(f"/api/v1/transactions/{tx['id']}/cancel/", {}, format="json")
+    res = client_for(customer).post(f"/api/v1/transactions/{tx['id']}/wave/")
+    assert res.status_code == 409 and res.data["code"] == "invalid_transition"
+    assert PaymentAttempt.objects.count() == 0
+
+
+def test_simulation_refused_when_disabled(visited, customer):
+    tx = create(customer, visited).data
+    with override_settings(PAYMENT_SIMULATION_ENABLED=False):
+        res = client_for(customer).post(f"/api/v1/transactions/{tx['id']}/simulate/")
+    assert res.status_code == 403 and res.data["code"] == "simulation_disabled"
+    assert Transaction.objects.get(pk=tx["id"]).status == "PENDING"
 
 
 def test_wave_flow_stays_pending_until_admin_confirms(visited, customer, admin):

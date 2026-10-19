@@ -209,3 +209,59 @@ def test_rules_mode_does_not_consume_llm_quota(api, catalog):
     api.post(URL, {"message": EXAMPLE}, format="json")
     usage = DailyUsage.objects.get(scope="global")
     assert usage.requests == 1 and usage.llm_requests == 0 and usage.provider_calls == 0
+
+
+def test_info_reports_real_provider_without_secrets(api):
+    res = api.get("/api/v1/assistant/info/")
+    assert res.status_code == 200 and res.data["llm_enabled"] is False and res.data["provider"] == "rules"
+    with override_settings(LLM_PROVIDER="gemini", LLM_API_KEY="cle-secrete-de-test", LLM_MODEL="gemini-2.5-flash-lite"):
+        res = api.get("/api/v1/assistant/info/")
+    assert res.data["llm_enabled"] is True and res.data["provider"] == "gemini"
+    assert "cle-secrete-de-test" not in json.dumps(res.data) and "gemini-2.5-flash-lite" not in json.dumps(res.data)
+
+
+def test_gemini_request_targets_model_and_never_puts_key_in_url():
+    seen = {}
+
+    def ok(request):
+        seen["url"], seen["body"] = str(request.url), json.loads(request.content)
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "{}"}]}}]})
+
+    GeminiProvider(api_key="cle", model="gemini-2.5-flash-lite", timeout=1, client=_mock_client(ok)).complete_json(system="s", user="u", max_tokens=50)
+    assert seen["url"].endswith("/models/gemini-2.5-flash-lite:generateContent") and "cle" not in seen["url"]
+    assert seen["body"]["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert seen["body"]["generationConfig"]["responseMimeType"] == "application/json"
+
+
+def test_gemini_rejected_key_falls_back_with_explicit_notice(api, catalog, monkeypatch):
+    from apps.assistant.providers.base import ProviderError
+
+    use(monkeypatch, FakeProvider(ProviderError("refus", http_status=403)))
+    res = api.post(URL, {"message": EXAMPLE}, format="json")
+    assert res.status_code == 200 and res.data["mode"] == "fallback"
+    assert "Assistant IA momentanément indisponible" in res.data["reply"]
+    assert LLMCallLog.objects.get().status == "error"
+
+
+def test_llm_configuration_checks():
+    from apps.assistant.checks import check_llm_configuration
+
+    with override_settings(LLM_PROVIDER="rules", LLM_API_KEY="", LLM_MODEL=""):
+        assert check_llm_configuration() == []
+    with override_settings(LLM_PROVIDER="gemini", LLM_API_KEY="", LLM_MODEL="gemini-2.5-flash-lite"):
+        assert [m.id for m in check_llm_configuration()] == ["assistant.W001"]
+    with override_settings(LLM_PROVIDER="gemni", LLM_API_KEY="k", LLM_MODEL="m"):
+        assert [m.id for m in check_llm_configuration()] == ["assistant.E001"]
+    with override_settings(LLM_PROVIDER="gemini", LLM_API_KEY="k", LLM_MODEL="m"):
+        assert check_llm_configuration() == []
+
+
+def test_admin_usage_reports_active_provider_not_just_configuration(admin):
+    url = "/api/v1/admin/assistant/usage/"
+    with override_settings(LLM_PROVIDER="gemini", LLM_API_KEY="", LLM_MODEL="gemini-2.5-flash-lite"):
+        data = client_for(admin).get(url).data
+    assert data["provider"] == "rules" and data["model"] == "" and data["configured_provider"] == "gemini"
+    with override_settings(LLM_PROVIDER="gemini", LLM_API_KEY="cle-de-test", LLM_MODEL="gemini-2.5-flash-lite"):
+        data = client_for(admin).get(url).data
+    assert data["provider"] == "gemini" and data["model"] == "gemini-2.5-flash-lite"
+    assert "cle-de-test" not in json.dumps(data)

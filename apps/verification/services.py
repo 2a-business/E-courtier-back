@@ -6,6 +6,7 @@ from django.utils import timezone
 from apps.core_errors import BusinessError, Forbidden, InvalidTransition
 from apps.listings.models import Listing, VerificationStatus
 from apps.listings.services import ensure_can_manage
+from apps.media.files import delete_after_commit
 from apps.moderation.services import log_action
 from apps.notifications.services import notify
 
@@ -38,7 +39,7 @@ def delete_document(*, actor, document: VerificationDocument) -> None:
     ensure_can_manage(actor, document.listing)
     if document.request_id:
         raise BusinessError("Un justificatif déjà soumis ne peut plus être supprimé.")
-    document.file.delete(save=False)
+    delete_after_commit(document.file)
     document.delete()
 
 

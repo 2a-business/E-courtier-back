@@ -3,6 +3,7 @@
 Le chargement échoue (ImproperlyConfigured) au lieu de démarrer avec une configuration incomplète ou dangereuse.
 """
 
+from pathlib import Path
 from urllib.parse import urlparse
 
 from django.core.exceptions import ImproperlyConfigured
@@ -58,6 +59,43 @@ if (_db.get("HOST") or "") not in ("localhost", "127.0.0.1", ""):
 _require(not PAYMENT_SIMULATION_ENABLED, "PAYMENT_SIMULATION_ENABLED doit être false en production.")  # noqa: F405
 if WAVE_PAYMENT_LINK:  # noqa: F405
     _require(urlparse(WAVE_PAYMENT_LINK).scheme == "https", "WAVE_PAYMENT_LINK doit être une URL https://.")  # noqa: F405
+
+# --- Fichiers -----------------------------------------------------------------------
+# Seuls les sous-dossiers publics (listings/) de MEDIA_ROOT sont diffusés. Les justificatifs peuvent vivre sur le
+# même volume (<volume>/private), mais jamais à la racine des médias ni dans un sous-dossier public.
+_media_root = Path(MEDIA_ROOT).resolve()  # noqa: F405
+_private_root = Path(PRIVATE_MEDIA_ROOT).resolve()  # noqa: F405
+_public_dirs = [_media_root / prefix for prefix in PUBLIC_MEDIA_PREFIXES]  # noqa: F405
+_require(
+    _private_root != _media_root
+    and not _media_root.is_relative_to(_private_root)
+    and not any(_private_root.is_relative_to(d) or d.is_relative_to(_private_root) for d in _public_dirs),
+    "PRIVATE_MEDIA_ROOT ne doit être ni MEDIA_ROOT, ni un parent, ni un sous-dossier public "
+    f"({', '.join(PUBLIC_MEDIA_PREFIXES)}/) : les justificatifs seraient publics.",  # noqa: F405
+)
+
+# --- E-mails ------------------------------------------------------------------------
+# Jamais de backend console/fichier/mémoire en production : ils perdent les messages ou écrivent
+# les liens de réinitialisation (jetons compris) dans les journaux.
+EMAIL_BACKEND = env("EMAIL_BACKEND") or "django.core.mail.backends.smtp.EmailBackend"
+_require(
+    not any(name in EMAIL_BACKEND for name in ("console", "filebased", "locmem", "dummy")),
+    f"EMAIL_BACKEND={EMAIL_BACKEND} est interdit en production (aucun envoi réel, jetons journalisés).",
+)
+_smtp = EMAIL_BACKEND == "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_ENABLED = bool(EMAIL_HOST) if _smtp else True  # noqa: F405
+if EMAIL_ENABLED:
+    _from = env("DEFAULT_FROM_EMAIL", "")
+    _require(bool(_from), "DEFAULT_FROM_EMAIL est obligatoire dès qu'un serveur d'envoi est configuré.")
+    _require(
+        not _from.rstrip("> ").endswith((".local", "example.sn", "example.com")),
+        "DEFAULT_FROM_EMAIL doit utiliser un domaine réel, autorisé par le fournisseur d'envoi.",
+    )
+    _require(not (EMAIL_USE_TLS and EMAIL_USE_SSL), "EMAIL_USE_TLS et EMAIL_USE_SSL sont exclusifs.")  # noqa: F405
+    _require(
+        not (_smtp and EMAIL_HOST_USER and not EMAIL_HOST_PASSWORD),  # noqa: F405
+        "EMAIL_HOST_PASSWORD est obligatoire quand EMAIL_HOST_USER est défini.",
+    )
 
 # --- HTTPS et cookies ---------------------------------------------------------------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

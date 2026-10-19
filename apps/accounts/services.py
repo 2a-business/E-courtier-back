@@ -1,5 +1,8 @@
 """Opérations métier sur les comptes."""
 
+import logging
+import smtplib
+
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.conf import settings
@@ -11,6 +14,8 @@ from apps.core_errors import BusinessError, Forbidden
 from apps.moderation.services import log_action
 
 from .models import PUBLIC_SIGNUP_ROLES, Profile, Role, User
+
+logger = logging.getLogger("ecourtier.accounts")
 
 
 @transaction.atomic
@@ -61,23 +66,41 @@ def set_active(*, actor: User, target: User, is_active: bool, reason: str = "") 
 
 
 def request_password_reset(email: str) -> None:
-    """Envoie un lien de réinitialisation si le compte existe. Ne révèle jamais son existence."""
+    """Envoie un lien de réinitialisation si le compte existe. Ne révèle jamais son existence.
+
+    Aucun envoi possible (service non configuré) → erreur explicite pour tous, avant toute recherche de compte.
+    Échec du serveur d'envoi → erreur explicite plutôt qu'un faux « lien envoyé ». Le lien et le jeton ne sont
+    jamais journalisés.
+    """
+    if not settings.EMAIL_ENABLED:
+        raise BusinessError(
+            "La réinitialisation par e-mail est momentanément indisponible. Contactez le support E-Courtier.",
+            code="email_not_configured", http_status=503,
+        )
     user = User.objects.filter(email__iexact=email, is_active=True).first()
     if not user:
         return
     uid = urlsafe_base64_encode(force_bytes(user.pk))
     token = default_token_generator.make_token(user)
     link = f"{settings.FRONTEND_URL}/reinitialiser-mot-de-passe?uid={uid}&token={token}"
-    send_mail(
-        subject="E-Courtier — réinitialisation du mot de passe",
-        message=(
-            f"Bonjour {user.first_name},\n\nPour choisir un nouveau mot de passe, ouvrez ce lien :\n{link}\n\n"
-            "Si vous n'êtes pas à l'origine de cette demande, ignorez ce message."
-        ),
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[user.email],
-        fail_silently=True,
+    message = (
+        f"Bonjour {user.first_name},\n\nPour choisir un nouveau mot de passe, ouvrez ce lien :\n{link}\n\n"
+        "Si vous n'êtes pas à l'origine de cette demande, ignorez ce message."
     )
+    try:
+        send_mail(
+            subject="E-Courtier — réinitialisation du mot de passe",
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+    except (smtplib.SMTPException, OSError) as exc:
+        logger.error("Échec d'envoi de l'e-mail de réinitialisation (utilisateur %s) : %s", user.pk, type(exc).__name__)
+        raise BusinessError(
+            "L'e-mail de réinitialisation n'a pas pu être envoyé. Réessayez dans quelques minutes.",
+            code="email_send_failed", http_status=503,
+        )
 
 
 def confirm_password_reset(*, uid: str, token: str, new_password: str) -> User:
