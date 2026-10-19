@@ -190,3 +190,57 @@ def test_remote_test_database_never_targets_application_server():
     assert_refused(run(PROBE, env_direct), "même serveur que DATABASE_URL")
     other = {**env, "TEST_DATABASE_URL": "postgresql://a:b@ep-branche-jetable-2.eu-central-1.aws.neon.tech/t?sslmode=require"}
     assert run(PROBE, other).returncode == 0
+
+
+STORAGE_PROBE = (
+    "import django; from django.conf import settings; django.setup(); "
+    "print(settings.MEDIA_ROOT, settings.PRIVATE_MEDIA_ROOT, settings.EMAIL_BACKEND, settings.EMAIL_ENABLED)"
+)
+
+
+def test_railway_volume_hosts_public_and_private_files():
+    """Volume monté sur /app/media : photos à la racine (chemins historiques), justificatifs dans private/."""
+    probe = (
+        "import django; from django.conf import settings; django.setup(); "
+        "from django.core.files.storage import storages; "
+        "print(settings.MEDIA_ROOT, settings.PRIVATE_MEDIA_ROOT, storages['default'].location, storages['private'].location)"
+    )
+    result = run(probe, {**PROD_OK, "RAILWAY_VOLUME_MOUNT_PATH": "/app/media"})
+    assert result.returncode == 0, result.stderr[-800:]
+    assert result.stdout.split() == ["/app/media", "/app/media/private", "/app/media", "/app/media/private"]
+
+
+@pytest.mark.parametrize("private", ["/app/media", "/app/media/listings", "/app/media/listings/x", "/app"])
+def test_private_files_never_public(private):
+    env = {**PROD_OK, "MEDIA_ROOT": "/app/media", "PRIVATE_MEDIA_ROOT": private}
+    assert_refused(run(STORAGE_PROBE, env), "les justificatifs seraient publics")
+
+
+def test_private_subfolder_of_volume_is_accepted():
+    env = {**PROD_OK, "MEDIA_ROOT": "/app/media", "PRIVATE_MEDIA_ROOT": "/app/media/private"}
+    assert run(STORAGE_PROBE, env).returncode == 0
+
+
+def test_production_email_defaults_to_smtp_and_is_disabled_without_host():
+    result = run(STORAGE_PROBE, PROD_OK)
+    assert result.returncode == 0, result.stderr[-800:]
+    assert result.stdout.split()[-2:] == ["django.core.mail.backends.smtp.EmailBackend", "False"]
+    smtp = {**PROD_OK, "EMAIL_HOST": "smtp.exemple-fournisseur.sn", "EMAIL_HOST_USER": "apikey",
+            "EMAIL_HOST_PASSWORD": "x" * 20, "DEFAULT_FROM_EMAIL": "E-Courtier <no-reply@e-courtier.sn>"}
+    enabled = run(STORAGE_PROBE, smtp)
+    assert enabled.returncode == 0, enabled.stderr[-800:]
+    assert enabled.stdout.split()[-1] == "True"
+
+
+@pytest.mark.parametrize(
+    "override, fragment",
+    [
+        ({"EMAIL_BACKEND": "django.core.mail.backends.console.EmailBackend"}, "est interdit en production"),
+        ({"EMAIL_HOST": "smtp.exemple-fournisseur.sn"}, "DEFAULT_FROM_EMAIL est obligatoire"),
+        ({"EMAIL_HOST": "smtp.exemple-fournisseur.sn", "DEFAULT_FROM_EMAIL": "E-Courtier <no-reply@e-courtier.local>"}, "domaine réel"),
+        ({"EMAIL_HOST": "smtp.exemple-fournisseur.sn", "DEFAULT_FROM_EMAIL": "no-reply@e-courtier.sn", "EMAIL_HOST_USER": "u"},
+         "EMAIL_HOST_PASSWORD est obligatoire"),
+    ],
+)
+def test_production_refuses_unsafe_email_configuration(override, fragment):
+    assert_refused(run(STORAGE_PROBE, {**PROD_OK, **override}), fragment)

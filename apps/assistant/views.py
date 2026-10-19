@@ -67,6 +67,8 @@ class AssistantInfoView(APIView):
         provider = get_provider()
         return Response({
             "llm_enabled": provider is not None,
+            # Fournisseur réellement utilisé (« rules » sans clé ou sans modèle). Jamais la clé ni le modèle.
+            "provider": provider.name if provider else "rules",
             "max_message_chars": settings.ASSISTANT_MAX_MESSAGE_CHARS,
             "suggestions": SUGGESTIONS,
         })
@@ -77,12 +79,15 @@ class AssistantUsageView(APIView):
 
     @extend_schema(responses={200: None}, tags=["admin"])
     def get(self, request):
+        active = get_provider()
         last = LLMCallLog.objects.order_by("-created_at")[:200]
         latencies = sorted(c.latency_ms for c in last if c.status == "ok")
         return Response({
             **quota.today_usage(),
-            "provider": settings.LLM_PROVIDER,
-            "model": settings.LLM_MODEL,
+            # Fournisseur réellement actif (« rules » si la clé ou le modèle manque), distinct de la configuration.
+            "provider": active.name if active else "rules",
+            "model": active.model if active else "",
+            "configured_provider": settings.LLM_PROVIDER,
             "recent_calls": len(last),
             "recent_errors": sum(1 for c in last if c.status != "ok"),
             "latency_p50_ms": latencies[len(latencies) // 2] if latencies else None,

@@ -6,6 +6,7 @@ from django.db.models import Max
 from django.utils import timezone
 
 from apps.core_errors import BusinessError, Forbidden, InvalidTransition
+from apps.media.files import delete_after_commit
 from apps.moderation.services import log_action
 
 from . import images
@@ -182,8 +183,7 @@ def delete_photo(*, actor, photo: ListingPhoto) -> None:
     listing = photo.listing
     ensure_can_manage(actor, listing)
     was_primary = photo.is_primary
-    photo.image.delete(save=False)
-    photo.thumbnail.delete(save=False)
+    delete_after_commit(photo.image, photo.thumbnail)
     photo.delete()
     if was_primary:
         nxt = listing.photos.order_by("position").first()
@@ -203,7 +203,6 @@ def delete_listing(*, actor, listing: Listing) -> None:
             "Seul un brouillon sans visite ni dossier peut être supprimé. Archivez plutôt l'annonce.", code="cannot_delete"
         )
     for photo in listing.photos.all():
-        photo.image.delete(save=False)
-        photo.thumbnail.delete(save=False)
+        delete_after_commit(photo.image, photo.thumbnail)
     log_action(actor=actor, action="listing.deleted", target=listing, metadata={"title": listing.title[:80]})
     listing.delete()

@@ -4,11 +4,11 @@ __pycache__/
 .env
 .env.*
 !.env.example
-media/
-private_media/
-staticfiles/
-.test_media/
-.test_private_media/
+/media/
+/private_media/
+/staticfiles/
+/.test_media/
+/.test_private_media/
 .coverage
 htmlcov/
 .pytest_cache/

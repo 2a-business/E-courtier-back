@@ -90,6 +90,39 @@ def test_password_reset_does_not_reveal_accounts_and_works(api, customer):
     assert res.status_code == 400
 
 
+def test_password_reset_email_content(api, customer, settings):
+    settings.FRONTEND_URL = "https://front.exemple.sn"
+    settings.DEFAULT_FROM_EMAIL = "E-Courtier <no-reply@e-courtier.sn>"
+    assert api.post("/api/v1/auth/password-reset/", {"email": customer.email.upper()}, format="json").status_code == 202
+    message = mail.outbox[0]
+    assert message.to == [customer.email] and message.from_email == "E-Courtier <no-reply@e-courtier.sn>"
+    assert f"https://front.exemple.sn/reinitialiser-mot-de-passe?uid={urlsafe_base64_encode(force_bytes(customer.pk))}&token=" in message.body
+
+
+def test_password_reset_refused_explicitly_when_email_disabled(api, customer, settings):
+    settings.EMAIL_ENABLED = False
+    for email in (customer.email, "inconnu@test.sn"):  # même réponse : l'existence du compte n'est pas révélée
+        res = api.post("/api/v1/auth/password-reset/", {"email": email}, format="json")
+        assert res.status_code == 503 and res.data["code"] == "email_not_configured"
+    assert len(mail.outbox) == 0
+
+
+def test_password_reset_smtp_failure_is_reported_without_leaking_token(api, customer, monkeypatch, caplog):
+    import smtplib
+
+    from apps.accounts import services
+
+    def broken(*args, **kwargs):
+        raise smtplib.SMTPAuthenticationError(535, b"refus")
+
+    monkeypatch.setattr(services, "send_mail", broken)
+    res = api.post("/api/v1/auth/password-reset/", {"email": customer.email}, format="json")
+    assert res.status_code == 503 and res.data["code"] == "email_send_failed"
+    token = default_token_generator.make_token(customer)
+    assert "SMTPAuthenticationError" in caplog.text
+    assert token not in caplog.text and "reinitialiser-mot-de-passe" not in caplog.text and customer.email not in caplog.text
+
+
 def test_admin_role_management(admin, customer):
     assert client_for(customer).post(f"/api/v1/admin/users/{customer.pk}/role/", {"role": "ADMIN"}, format="json").status_code == 403
     res = client_for(admin).post(f"/api/v1/admin/users/{customer.pk}/role/", {"role": "AGENT"}, format="json")

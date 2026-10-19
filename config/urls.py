@@ -1,7 +1,9 @@
+import re
+
 from django.conf import settings
 from django.contrib import admin
 from django.http import JsonResponse
-from django.urls import include, path
+from django.urls import include, path, re_path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 from apps.accounts import urls as accounts_urls
@@ -36,6 +38,7 @@ api_v1 = [
     path("verification/", include(verification_urls.urlpatterns)),
     path("assistant/", include(assistant_urls.urlpatterns)),
     path("visits/", include("apps.visits.urls")),
+    path("applications/", include("apps.applications.urls")),
     path("transactions/", include(transactions_urls.urlpatterns)),
     path("contracts/", include("apps.contracts.urls")),
     path("reviews/", include(reviews_urls.urlpatterns)),
@@ -53,7 +56,9 @@ urlpatterns = [
     path("django-admin/", admin.site.urls),
 ]
 
-if settings.DEBUG:
-    from django.conf.urls.static import static
+# Stockage local (volume Railway) : les photos publiques sont servies par Django, y compris en production.
+# Avec un stockage S3, les URL pointent directement vers le bucket et cette route n'existe pas.
+if settings.STORAGES["default"]["BACKEND"] == "django.core.files.storage.FileSystemStorage":
+    from apps.media.views import serve_public_media
 
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += [re_path(rf"^{re.escape(settings.MEDIA_URL.lstrip('/'))}(?P<path>.+)$", serve_public_media, name="public-media")]
