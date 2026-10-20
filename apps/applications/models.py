@@ -135,3 +135,48 @@ class ApplicationNote(models.Model):
 
     class Meta:
         ordering = ["created_at", "id"]
+
+
+class FeePaymentStatus(models.TextChoices):
+    PENDING = "PENDING", "À payer"
+    AWAITING_VERIFICATION = "AWAITING_VERIFICATION", "Paiement en attente de vérification"
+    CONFIRMED = "CONFIRMED", "Paiement confirmé"
+    FAILED = "FAILED", "Paiement non retrouvé"
+    CANCELLED = "CANCELLED", "Annulé"
+
+
+class ApplicationFeePayment(models.Model):
+    """Frais de dossier d'une candidature locative, payés par lien Wave Business.
+
+    Le montant est figé côté serveur à la transmission (DOSSIER_FEE_XOF). Un lien Wave statique ne fournit aucune
+    confirmation : seule une confirmation par un administrateur, après rapprochement dans Wave Business, fait
+    passer le paiement à CONFIRMED. Le clic, le retour sur le site ou la déclaration du client n'y suffisent jamais.
+    """
+
+    application = models.OneToOneField(RentalApplication, on_delete=models.CASCADE, related_name="fee_payment")
+    amount = models.PositiveIntegerField("frais de dossier (FCFA)")
+    currency = models.CharField(max_length=3, default="XOF", editable=False)
+    status = models.CharField(max_length=24, choices=FeePaymentStatus.choices, default=FeePaymentStatus.PENDING, db_index=True)
+    provider_reference = models.CharField("référence Wave", max_length=64, blank=True)
+    checkout_started_at = models.DateTimeField(null=True, blank=True)
+    declared_at = models.DateTimeField(null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    failure_reason = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider_reference"], condition=~Q(provider_reference=""), name="unique_fee_provider_reference"
+            ),
+            models.CheckConstraint(condition=~Q(status="CONFIRMED") | Q(confirmed_at__isnull=False), name="fee_confirmed_has_date"),
+            models.CheckConstraint(condition=Q(currency="XOF"), name="fee_currency_xof"),
+        ]
+
+    @property
+    def reference(self) -> str:
+        """Référence à indiquer dans Wave pour faciliter le rapprochement."""
+        return f"DL-{str(self.application_id).split('-')[0].upper()}"

@@ -2,22 +2,27 @@ from django.db.models import Prefetch
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import OpenApiParameter, OpenApiTypes, extend_schema
-from rest_framework import status
+from rest_framework import generics, status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.permissions import IsAdminRole
 from apps.listings.models import ListingPhoto
 
 from . import services
-from .models import ApplicationDocument, ApplicationStatus, RentalApplication
+from .models import ApplicationDocument, ApplicationFeePayment, ApplicationStatus, FeePaymentStatus, RentalApplication
 from .serializers import (
+    AdminFeeConfirmSerializer,
+    AdminFeePaymentSerializer,
+    AdminFeeRejectSerializer,
     ApplicationDetailSerializer,
     ApplicationDocumentSerializer,
     ApplicationInfoSerializer,
     ApplicationListSerializer,
     ApplicationNoteSerializer,
+    FeeDeclareSerializer,
     ApplicationDecisionSerializer,
     ApplicationDocumentUploadSerializer,
     InfoRequestSerializer,
@@ -36,7 +41,7 @@ def _base_qs():
 
 
 def _detail_qs():
-    return _base_qs().prefetch_related("documents", "events__actor")
+    return _base_qs().select_related("visit__slot", "listing__owner__profile").prefetch_related("documents", "events__actor")
 
 
 def _get_for(request, pk, *roles):
@@ -203,3 +208,68 @@ class NotesView(APIView):
         note = services.add_note(actor=request.user, app=app, text=serializer.validated_data["text"])
         return Response(ApplicationNoteSerializer(note).data, status=status.HTTP_201_CREATED)
 
+
+
+class FeeStartView(APIView):
+    """Ouvre le paiement Wave des frais : renvoie le lien configuré côté serveur, après contrôle du montant."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=None, responses={200: None}, tags=TAGS)
+    def post(self, request, pk):
+        app = _get_for(request, pk, "customer")
+        _, checkout = services.start_fee_payment(actor=request.user, app=app)
+        return Response({"checkout": checkout, "application": ApplicationDetailSerializer(
+            get_object_or_404(_detail_qs(), pk=app.pk), context={"request": request}).data})
+
+
+class FeeDeclareView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=FeeDeclareSerializer, responses={200: ApplicationDetailSerializer}, tags=TAGS)
+    def post(self, request, pk):
+        app = _get_for(request, pk, "customer")
+        serializer = FeeDeclareSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        services.declare_fee_payment(actor=request.user, app=app, provider_reference=serializer.validated_data["provider_reference"])
+        return _detail(request, app)
+
+
+class AdminFeePaymentListView(generics.ListAPIView):
+    """File de rapprochement des frais de dossier (les paiements à vérifier d'abord)."""
+
+    serializer_class = AdminFeePaymentSerializer
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(parameters=[OpenApiParameter("status", str, required=False)], tags=["admin"])
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        qs = ApplicationFeePayment.objects.select_related("application__listing", "application__customer").order_by("declared_at", "created_at")
+        wanted = self.request.query_params.get("status")
+        return qs.filter(status=wanted) if wanted in FeePaymentStatus.values else qs
+
+
+class AdminFeeConfirmView(APIView):
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(request=AdminFeeConfirmSerializer, responses={200: AdminFeePaymentSerializer}, tags=["admin"])
+    def post(self, request, pk):
+        fee = get_object_or_404(ApplicationFeePayment, pk=pk)
+        serializer = AdminFeeConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        fee = services.confirm_fee_payment(actor=request.user, fee=fee, **serializer.validated_data)
+        return Response(AdminFeePaymentSerializer(fee).data)
+
+
+class AdminFeeRejectView(APIView):
+    permission_classes = [IsAdminRole]
+
+    @extend_schema(request=AdminFeeRejectSerializer, responses={200: AdminFeePaymentSerializer}, tags=["admin"])
+    def post(self, request, pk):
+        fee = get_object_or_404(ApplicationFeePayment, pk=pk)
+        serializer = AdminFeeRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        fee = services.reject_fee_payment(actor=request.user, fee=fee, reason=serializer.validated_data["reason"])
+        return Response(AdminFeePaymentSerializer(fee).data)

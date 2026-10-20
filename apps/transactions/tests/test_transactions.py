@@ -29,7 +29,8 @@ def test_requires_confirmed_visit(listing, customer):
 def test_amounts_computed_server_side_and_fee_separate(visited, customer):
     res = create(customer, visited)
     assert res.status_code == 201
-    assert res.data["amount"] == 250000 and res.data["fee_amount"] == 5000 and res.data["total_amount"] == 255000
+    # Location : les frais de dossier sont réglés via le dossier locatif, jamais une seconde fois ici.
+    assert res.data["amount"] == 250000 and res.data["fee_amount"] == 0 and res.data["total_amount"] == 250000
     assert res.data["amount_kind"] == "FIRST_MONTH_RENT" and res.data["status"] == "PENDING"
     assert res.data["currency"] == "XOF" and res.data["is_simulated"] is False
 

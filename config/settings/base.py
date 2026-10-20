@@ -288,6 +288,8 @@ MAX_APPLICATION_DOCUMENTS = env_int("MAX_APPLICATION_DOCUMENTS", 15)
 # --- Paiement -------------------------------------------------------------------
 # Lien de paiement Wave Business (marchand). Le client y saisit le montant puis confirme dans son appli.
 WAVE_PAYMENT_LINK = env("WAVE_PAYMENT_LINK", "")
+# Lien facultatif dédié aux frais de dossier (souvent un lien à montant fixe) ; à défaut, WAVE_PAYMENT_LINK.
+WAVE_DOSSIER_FEE_LINK = env("WAVE_DOSSIER_FEE_LINK", "")
 # La simulation est interdite en production (voir prod.py).
 PAYMENT_SIMULATION_ENABLED = env_bool("PAYMENT_SIMULATION_ENABLED", False)
 

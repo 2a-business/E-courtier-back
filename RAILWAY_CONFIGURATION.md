@@ -74,7 +74,7 @@ Conséquences d'un volume sur Railway (à connaître) :
 | **Custom Build Command** | `python manage.py check --deploy && python manage.py collectstatic --noinput` |
 | **Custom Start Command** | **vide** — le `Procfile` du dépôt fournit `gunicorn config.wsgi:application --config gunicorn.conf.py` |
 | Pre-deploy Command | **vide** (aucune migration automatique, voir §3) |
-| **Healthcheck Path** | `/health/` |
+| **Healthcheck Path** | `/health/ready/` — 200 seulement si la base répond **et** toutes les migrations sont appliquées ; sinon 503 et Railway garde l'ancien déploiement. L'hôte `healthcheck.railway.app` est autorisé et `/health/` est exempté de la redirection HTTPS (`prod.py`). |
 | Healthcheck Timeout | 60 s |
 | Restart policy | On failure, 10 essais (inchangé) |
 | Replicas | 1 (obligatoire avec un volume) |
@@ -111,7 +111,9 @@ Aucune valeur secrète n'est indiquée ici.
 | `FRONTEND_URL` | ✅ | idem (liens des e-mails) |
 | `REFRESH_COOKIE_SAMESITE` / `REFRESH_COOKIE_SECURE` | ✅ | `None` / `true` (domaines distincts) |
 | `PAYMENT_SIMULATION_ENABLED` | ✅ | `false` |
-| `WAVE_PAYMENT_LINK` | ✅ | Lien marchand Wave Business `https://pay.wave.com/…` (présent depuis le 2026-10-19) |
+| `WAVE_PAYMENT_LINK` | ✏️ | Lien marchand Wave Business `https://pay.wave.com/…`. **Constat 2026-10-20 : il est fixé à `amount=7500`.** Un lien à montant fixe n'est utilisable que pour ce montant exact : il est refusé (503 explicite) pour les frais de dossier (5 000 FCFA) et pour le premier loyer (montant variable). Recommandé : un lien **sans** paramètre `amount` (le client saisit le montant indiqué). |
+| `WAVE_DOSSIER_FEE_LINK` | ➕ (recommandé) | Lien Wave dédié aux **frais de dossier**, à montant fixe **5 000 FCFA** (`…?amount=5000`) ou sans montant. À défaut, `WAVE_PAYMENT_LINK` est utilisé. Le backend compare le montant du lien à `DOSSIER_FEE_XOF` et désactive le paiement en cas d'écart. |
+| `DOSSIER_FEE_XOF` | ✅ | `5000` — montant officiel des frais de dossier (décision du 2026-10-20), figé à la transmission de chaque dossier |
 | `RAILWAY_VOLUME_MOUNT_PATH` | ✅ automatique | `/app/media`, fournie par Railway (volume attaché) — ne pas la créer à la main |
 | `MEDIA_ROOT` / `PRIVATE_MEDIA_ROOT` | ne pas définir | Déduites : `/app/media` et `/app/media/private` |
 | `EMAIL_HOST` | ➕ | Serveur SMTP du fournisseur choisi |
@@ -169,7 +171,7 @@ Principe : **aucune migration automatique** au démarrage ni au déploiement. El
 explicitement, depuis un poste de confiance, avec l'URL Neon **directe** (sans `-pooler`) : les migrations
 utilisent des verrous et des transactions longues mal adaptés au pooler en mode transaction.
 
-**Migration à appliquer pour ce lot : `applications 0001_initial`** (dossier locatif) — additive uniquement
+**Migrations à appliquer : `applications 0001_initial` et `applications 0002_fee_payment`** — constat du 2026-10-20 : la 0001 n'a **pas** été appliquée sur Neon, d'où l'erreur 500 « relation applications_rentalapplication does not exist » sur « Constituer mon dossier ». Les deux sont additives uniquement
 (4 nouvelles tables, 3 contraintes ; aucune table existante modifiée). Elle doit être appliquée **avant** le
 déploiement du nouveau backend : sans elle, les routes `/api/v1/applications/…` répondent 500 (le reste du site
 fonctionne). L'ancien code ignore ces tables : l'appliquer en avance est sans risque. Au dernier démarrage, toutes
@@ -201,13 +203,13 @@ moment voulu.
 1. **Backend — volume** : ✅ fait (monté sur `/app/media`). Ne pas le déplacer : le code attend ce chemin.
    Avant le déploiement, **ne pas téléverser de justificatifs** : l'ancien code les écrit hors volume.
 2. **Backend — réglages Railway** : Build Command `python manage.py check --deploy && python manage.py collectstatic --noinput`,
-   Start Command **vide** (Procfile), Healthcheck `/health/` (§1.2). Ces réglages s'appliqueront au prochain déploiement.
+   Start Command **vide** (Procfile), Healthcheck `/health/ready/` (§1.2). Ces réglages s'appliqueront au prochain déploiement.
 3. **Backend — variables** : ressaisir `DATABASE_URL` sans les espaces initiaux ; SMTP si un fournisseur est prêt ;
    Gemini si souhaité ; `RENTAL_APPLICATION_REQUIRED_DOCS` seulement pour changer le défaut (§1.3). Modifier une
    variable redéploie le code **actuel** (sans effet fonctionnel) : regrouper les modifications.
-4. **Neon — migration `applications 0001`** depuis le poste local, avec le code de la branche (§3) :
+4. **Neon — migrations `applications 0001` et `0002`** depuis le poste local, avec le code de la branche (§3) :
    `scripts/neon_init.sh .env.production.local <hôte-neon-direct> ecourtier` → vérifier que le plan ne contient
-   que `applications.0001_initial`, confirmer.
+   que `applications.0001_initial` et `applications.0002_fee_payment`, confirmer.
 5. **Backend — déploiement** : fusionner `fix/production-readiness` dans `main` (E-courtier-back). Logs de build :
    `check --deploy` sans erreur, `collectstatic` OK. Logs d'exécution : `Using worker: gthread`, **aucune** ligne
    `Running migrations`.
@@ -257,6 +259,11 @@ Ne cocher qu'après observation réelle en production.
       reçue par le propriétaire ; l'autre propriétaire obtient 403 sur le dossier et sur la pièce ;
       `GET /media/private/applications/…` → 404 ; complément demandé → retransmission → acceptation ou refus motivé
       visibles dans l'historique côté client.
+- [ ] `GET /health/ready/` → 200 `{"status": "ready"}` (sinon : migrations manquantes).
+- [ ] Frais de dossier : dossier transmis → bloc « Frais de dossier » à 5 000 FCFA ; avec un lien à 7 500 FCFA, message
+      « fixé à 7 500 FCFA alors que le montant dû est de 5 000 FCFA » et aucun bouton Wave ; avec un lien à 5 000 FCFA,
+      « Payer 5 000 FCFA avec Wave » ouvre `pay.wave.com` ; déclaration → « en attente de vérification » ; l'acceptation
+      reste bloquée jusqu'à la confirmation dans Admin → Frais de dossier.
 - [ ] Paiement (compte client de test, sans payer) : « Payer avec Wave » ouvre `pay.wave.com` ; la page propose
       ensuite la déclaration ; un second clic ne crée pas de seconde tentative ; le dossier reste « En attente ».
 - [ ] Paiement réel contrôlé (petit montant, compte de test, avec accord) : déclaration → rapprochement dans

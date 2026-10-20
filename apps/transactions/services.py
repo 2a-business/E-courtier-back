@@ -39,13 +39,21 @@ TRANSITIONS = {
 }
 
 
+def _reference_used_by_fee(reference: str) -> bool:
+    """Une référence Wave déjà utilisée pour des frais de dossier ne peut pas justifier un autre paiement."""
+    from apps.applications.models import ApplicationFeePayment
+
+    return ApplicationFeePayment.objects.filter(provider_reference=reference).exists()
+
+
 def _reference() -> str:
     return f"EC-{timezone.now():%y%m%d}-{secrets.token_hex(3).upper()}"
 
 
 def compute_amounts(listing: Listing) -> tuple[int, str, int]:
     if listing.transaction_type == TransactionType.RENT:
-        return listing.price, AmountKind.FIRST_MONTH_RENT, settings.DOSSIER_FEE_XOF
+        # Location : les frais de dossier sont réglés une seule fois, via le dossier locatif (apps.applications).
+        return listing.price, AmountKind.FIRST_MONTH_RENT, 0
     deposit = listing.price * settings.SALE_DEPOSIT_PERCENT // 100
     return deposit, AmountKind.RESERVATION_DEPOSIT, settings.DOSSIER_FEE_XOF
 
@@ -144,7 +152,7 @@ def declare_payment(*, customer, tx: Transaction, provider_reference: str) -> Pa
     if tx.status != TransactionStatus.PENDING:
         raise InvalidTransition("Ce dossier n'est plus en attente de paiement.")
     reference = provider_reference.strip().upper()
-    if PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exclude(transaction=tx).exists():
+    if _reference_used_by_fee(reference) or PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exclude(transaction=tx).exists():
         raise Conflict("Cette référence Wave est déjà associée à un autre dossier.", code="duplicate_reference")
     # Une déclaration n'est possible qu'après une redirection réelle vers Wave (lien marchand configuré).
     # Une seconde déclaration corrige la référence de la même tentative ; le statut reste PENDING.
@@ -201,7 +209,7 @@ def confirm_payment(*, actor, tx: Transaction, provider_reference: str, note: st
     reference = provider_reference.strip().upper()
     if not reference:
         raise BusinessError("La référence Wave vérifiée est obligatoire.", code="reference_required")
-    if PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exclude(transaction=tx).exists():
+    if _reference_used_by_fee(reference) or PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exclude(transaction=tx).exists():
         raise Conflict("Cette référence Wave est déjà associée à un autre dossier.", code="duplicate_reference")
     attempt = tx.attempts.filter(provider=Provider.WAVE_LINK, provider_reference=reference).first() or \
         tx.attempts.filter(provider=Provider.WAVE_LINK).exclude(status=AttemptStatus.REJECTED).first() or \
