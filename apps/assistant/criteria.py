@@ -1,6 +1,7 @@
 """Critères de recherche de l'assistant : extraction par règles, validation de la sortie LLM et conversion
 en paramètres de recherche. Toute valeur issue du LLM est revalidée ici ; rien n'est pris pour argent comptant."""
 
+import difflib
 import json
 import re
 import unicodedata
@@ -27,10 +28,33 @@ KNOWN_DISTRICTS = [
 NUMBER_WORDS = {"un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6, "sept": 7, "huit": 8}
 
 PROPERTY_WORDS = [
-    (r"\bappart(?:ement)?s?\b", PropertyType.APARTMENT), (r"\bvillas?\b", PropertyType.VILLA),
+    # appart, apparts, appartement(s), apart, apartement, appt (variantes et fautes courantes).
+    (r"\bap+art?(?:e?ments?)?s?\b|\bap+ts?\b", PropertyType.APARTMENT), (r"\bvillas?\b", PropertyType.VILLA),
     (r"\bmaisons?\b", PropertyType.HOUSE), (r"\bstudios?\b", PropertyType.STUDIO),
     (r"\bterrains?\b|\bparcelles? a batir\b", PropertyType.LAND), (r"\bbureaux?\b|\blocal commercial\b", PropertyType.OFFICE),
 ]
+
+
+# Vocabulaire corrigé en cas de faute de frappe (« appartemnt », « studo », « locaton »…).
+VOCABULARY = (
+    "appartement", "appartements", "studio", "studios", "villa", "villas", "maison", "maisons", "chambre",
+    "chambres", "location", "louer", "acheter", "achat", "vente", "meuble", "meubles", "terrain", "bureau",
+)
+BROWSE = r"\b(annonces?|logements?|biens?|offres?|tout|toutes|tous|disponibles?|site|catalogue|liste|propositions?)\b"
+GENERIC_WORDS = {"site", "web", "donne", "donnez", "moi", "les", "des", "une", "pour", "avec", "dans", "tout", "toutes",
+                 "annonce", "annonces", "logement", "logements", "cherche", "recherche", "voudrais", "veux", "louer",
+                 "appart", "apparts", "appartement", "appartements", "maison", "villa", "studio", "chambre", "prix"}
+
+
+def correct_typos(text: str) -> str:
+    """Remplace les mots proches du vocabulaire immobilier (≥ 5 lettres) par leur forme correcte."""
+    words = []
+    for word in text.split():
+        if len(word) >= 5 and word not in VOCABULARY:
+            close = difflib.get_close_matches(word, VOCABULARY, n=1, cutoff=0.82)
+            word = close[0] if close else word
+        words.append(word)
+    return " ".join(words)
 
 
 def strip_accents(value: str) -> str:
@@ -60,17 +84,27 @@ AMOUNT = r"(\d{1,3}(?:[ . ]\d{3})+|\d+(?:,\d+)?)\s*(millions?|mille|k|m)?\b"
 
 
 def extract_rules(message: str, amenity_index=None, places=None) -> dict:
-    text = normalize(message)
+    text = correct_typos(normalize(message))
     raw = message.lower()
     c = empty()
 
-    if re.search(r"\b(louer|location|a louer|loyer|par mois|mensuel)\b", text) or "/mois" in raw:
+    rent = bool(re.search(r"\b(louer|location|a louer|loyer|par mois|mensuel)\b", text) or "/mois" in raw)
+    sale = bool(re.search(r"\b(acheter|achat|vente|a vendre|acquerir)\b", text))
+    if rent and sale:
+        c["_ambiguous_transaction"] = True  # « louer ou acheter » : on ne choisit pas à la place du client
+    elif rent:
         c["transaction_type"] = TransactionType.RENT
-    elif re.search(r"\b(acheter|achat|vente|a vendre|acquerir)\b", text):
+    elif sale:
         c["transaction_type"] = TransactionType.SALE
+    c["_browse"] = bool(re.search(BROWSE, text))
+    c["_compare"] = bool(re.search(r"\bcompar", text))
 
     types = [ptype.value for pattern, ptype in PROPERTY_WORDS if re.search(pattern, text)]
-    if not types and re.search(r"\b(une|1) chambre\b(?! .*\bpieces?\b)", text) and not re.search(r"\d+\s*pieces?", text):
+    if not types and not re.search(r"\d+\s*pieces?", text) and (
+        re.search(r"\b(une|1) chambre\b(?! .*\bpieces?\b)", text)
+        or re.search(r"\bchambres? (a louer|meublees?|pour etudiants?)\b", text)
+        or re.match(r"chambres?\b", text)
+    ):
         types = [PropertyType.ROOM.value]
     c["property_type"] = types or None
 
@@ -123,7 +157,34 @@ def _longest_match(text: str, names) -> str | None:
         key = normalize(name)
         if key and re.search(rf"\b{re.escape(key)}\b", text) and (best is None or len(key) > len(normalize(best))):
             best = name
+    return best or _fuzzy_match(text, names)
+
+
+def _fuzzy_match(text: str, names) -> str | None:
+    """Lieu mal orthographié (« Kenya » → « Kenia », « Ziginchor » → « Ziguinchor ») : même initiale, forte similarité."""
+    keys = {normalize(n): n for n in names if len(normalize(n)) >= 4}
+    words = [w for w in text.split() if len(w) >= 4 and w not in GENERIC_WORDS]
+    candidates = words + [f"{a} {b}" for a, b in zip(words, words[1:])]
+    best, best_score = None, 0.0
+    for cand in candidates:
+        for key, name in keys.items():
+            if key[0] != cand[0]:
+                continue
+            score = difflib.SequenceMatcher(None, cand, key).ratio()
+            if score >= 0.8 and score > best_score:
+                best, best_score = name, score
     return best
+
+
+def canonical_place(value: str | None, names) -> str | None:
+    """Ramène un lieu (issu du LLM ou des règles) à son orthographe réelle dans les annonces, si elle est proche."""
+    if not value:
+        return value
+    key = normalize(value)
+    for name in names:
+        if normalize(name) == key:
+            return name
+    return _fuzzy_match(key, names) or value
 
 
 def known_places():
