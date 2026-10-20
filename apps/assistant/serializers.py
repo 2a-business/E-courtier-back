@@ -15,7 +15,9 @@ class ChatResponseSerializer(serializers.Serializer):
     reply = serializers.CharField()
     criteria = serializers.DictField()
     results = ListingCardSerializer(many=True)
+    total = serializers.IntegerField(help_text="Nombre total d'annonces publiées correspondant exactement (au-delà de celles affichées).")
     alternatives = ListingCardSerializer(many=True)
+    relaxed = serializers.ListField(child=serializers.CharField(), help_text="Critères élargis pour obtenir les alternatives.")
     mode = serializers.ChoiceField(choices=["llm", "rules", "fallback"])
     remaining_today = serializers.IntegerField()
 

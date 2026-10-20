@@ -12,8 +12,9 @@ import time
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db import transaction
+from django.db import DatabaseError, transaction
 
+from apps.core_errors import BusinessError
 from apps.listings.models import Amenity, PropertyType
 
 from . import criteria as crit
@@ -42,6 +43,9 @@ surface_min: entier en m² | null
 furnished: true | false | null
 amenities: liste parmi {amenities}
 verified_only: true | false
+Synonymes : appart, apparts, appartement, F2/F3 → APARTMENT ; maison → HOUSE ; chambre à louer → ROOM.
+Une demande générale (« les apparts du site », « vos logements disponibles ») est intent "search".
+Corrige les fautes évidentes de lieu (« Ziginchor » → "Ziguinchor").
 N'invente jamais de valeur absente du message. Ne propose aucune annonce. "300k" = 300000 ; "1,5 million" = 1500000."""
 
 
@@ -113,8 +117,66 @@ HELP_TEXT = (
 )
 
 
+class SearchUnavailable(BusinessError):
+    """La base n'a pas pu être interrogée : jamais présenté comme une absence d'annonces."""
+
+    code = "search_unavailable"
+    http_status = 503
+
+    def __init__(self):
+        super().__init__("La recherche d'annonces est momentanément indisponible. Réessayez dans un instant : "
+                         "cela ne signifie pas qu'aucune annonce ne correspond.")
+
+
+def _fmt_price(value: int) -> str:
+    return f"{value:,}".replace(",", " ") + " FCFA"
+
+
+def _listing_line(listing) -> str:
+    """Faits réels d'une annonce (aucune donnée inventée)."""
+    suffix = " / mois" if listing.transaction_type == "RENT" else ""
+    parts = [f"« {listing.title} »", listing.get_property_type_display(), f"{_fmt_price(listing.price)}{suffix}",
+             f"{listing.district}, {listing.city}", f"{listing.rooms} pièce{'s' if listing.rooms > 1 else ''}"]
+    if listing.surface_m2:
+        parts.append(f"{listing.surface_m2} m²")
+    if listing.is_verified:
+        parts.append("vérifiée")
+    return " — ".join(parts)
+
+
+WITH_ARTICLE = {
+    "APARTMENT": "un appartement", "HOUSE": "une maison", "VILLA": "une villa", "STUDIO": "un studio",
+    "ROOM": "une chambre", "LAND": "un terrain", "OFFICE": "un bureau ou local",
+}
+
+
+def _mismatch_note(found, criteria) -> str:
+    """Signale honnêtement une annonce retenue par son titre alors que l'annonceur l'a classée autrement."""
+    if not found.type_mismatches or not criteria.get("property_type"):
+        return ""
+    wanted = " ou ".join(WITH_ARTICLE[t] for t in criteria["property_type"])
+    notes = [f"« {listing.title} » est classée « {listing.get_property_type_display()} » par l'annonceur"
+             for listing in found.type_mismatches]
+    return f" Remarque : {' ; '.join(notes)}, mais son titre évoque {wanted} ; vérifiez le détail de l'annonce."
+
+
+def _compare(conversation) -> tuple[str, list]:
+    from apps.listings.selectors import card_queryset
+
+    last = conversation.messages.filter(role="assistant").exclude(listing_ids=[]).order_by("-created_at").first()
+    ids = (last.listing_ids if last else [])[:4]
+    listings = {str(listing.pk): listing for listing in card_queryset().filter(pk__in=ids)}
+    ordered = [listings[i] for i in ids if i in listings]
+    if len(ordered) < 2:
+        return ("Pour comparer, lancez d'abord une recherche qui renvoie au moins deux annonces, puis demandez « compare-les ».", ordered)
+    lines = [f"{n}. {_listing_line(listing)}" for n, listing in enumerate(ordered, 1)]
+    cheapest = min(ordered, key=lambda listing: listing.price)
+    return ("Comparaison des annonces affichées (données des annonces publiées) :\n" + "\n".join(lines)
+            + f"\nLa moins chère : « {cheapest.title} ».", ordered)
+
+
 def handle_message(*, user, anon_key: str, text: str, conversation_id=None) -> dict:
-    from apps.search.selectors import search_listings
+    from . import finder
 
     text = text.strip()[: settings.ASSISTANT_MAX_MESSAGE_CHARS]
     scope, limit = quota.user_scope(user, anon_key)
@@ -129,6 +191,13 @@ def handle_message(*, user, anon_key: str, text: str, conversation_id=None) -> d
         )
     previous = conversation.last_criteria or {}
 
+    try:
+        places = crit.known_places()
+        rules = crit.extract_rules(text, places=places)  # signaux déterministes, utilisés dans tous les modes
+    except DatabaseError:
+        logger.exception("Assistant : lecture des lieux impossible")
+        raise SearchUnavailable()
+
     provider = configured if llm_allowed else None
     parsed, mode = None, "rules"
     if provider:
@@ -141,37 +210,64 @@ def handle_message(*, user, anon_key: str, text: str, conversation_id=None) -> d
         )
         parsed = call_llm(provider, user_prompt=prompt, scope=scope)
         mode = "llm" if parsed is not None else "fallback"
+        if parsed is not None:
+            # Le LLM interprète ; les règles complètent ce qu'il a laissé vide (jamais l'inverse).
+            for key in crit.FIELDS:
+                if parsed.get(key) in (None, [], "") and rules.get(key) not in (None, [], ""):
+                    parsed[key] = rules[key]
     if parsed is None:
-        parsed = crit.extract_rules(text)
-        parsed["_intent"] = "search" if crit.has_criteria(parsed) else (
+        parsed = dict(rules)
+        parsed["_intent"] = "search" if crit.has_criteria(parsed) or rules["_browse"] else (
             "greeting" if any(w in crit.normalize(text) for w in GREETING_WORDS) else "other"
         )
         # Sans LLM, un message avec de nouveaux critères de type/transaction relance une recherche.
         parsed["_reset"] = bool(parsed.get("transaction_type") or parsed.get("property_type")) and bool(previous)
+    for key in ("city", "district"):
+        parsed[key] = crit.canonical_place(parsed.get(key), places[0] if key == "city" else places[1])
 
     with transaction.atomic():
         Message.objects.create(conversation=conversation, role="user", text=text)
-        if parsed.get("_intent") != "search" and not crit.has_criteria(parsed):
-            reply = ("Bonjour ! " if parsed.get("_intent") == "greeting" else "") + HELP_TEXT
-            Message.objects.create(conversation=conversation, role="assistant", text=reply, mode=mode)
-            return _payload(conversation, reply, previous, [], [], mode, remaining)
+        if rules["_compare"]:
+            reply, compared = _compare(conversation)
+            Message.objects.create(conversation=conversation, role="assistant", text=reply, mode=mode,
+                                   listing_ids=[str(listing.pk) for listing in compared])
+            return _payload(conversation, reply, previous, compared, [], mode, remaining)
+
+        if not crit.has_criteria(parsed):
+            if rules["_browse"]:
+                # « Donne-moi les annonces du site » : catalogue complet des annonces publiées.
+                parsed["_reset"] = True
+            elif parsed.get("_intent") != "search":
+                reply = ("Bonjour ! " if parsed.get("_intent") == "greeting" else "") + HELP_TEXT
+                Message.objects.create(conversation=conversation, role="assistant", text=reply, mode=mode)
+                return _payload(conversation, reply, previous, [], [], mode, remaining)
 
         merged = crit.merge(previous, parsed)
-        params = crit.to_search_params(merged)
-        results = list(search_listings(params)[: settings.ASSISTANT_RESULTS_LIMIT])
-        alternatives = []
-        if not results:
-            relaxed = crit.to_search_params(merged, relaxed=True)
-            alternatives = list(search_listings(relaxed)[: settings.ASSISTANT_RESULTS_LIMIT])
+        try:
+            found = finder.find(merged, limit=settings.ASSISTANT_RESULTS_LIMIT)
+        except DatabaseError:
+            logger.exception("Assistant : recherche d'annonces impossible")
+            raise SearchUnavailable()
 
-        summary = crit.describe(merged) or "vos critères"
-        if results:
-            reply = f"Voici {len(results)} logement{'s' if len(results) > 1 else ''} publié{'s' if len(results) > 1 else ''} correspondant à : {summary}."
-        elif alternatives:
-            reply = (f"Aucune annonce ne correspond exactement à : {summary}. "
-                     "Voici des logements proches (budget un peu plus large, quartier ou équipements élargis).")
+        summary = crit.describe(merged)
+        target = f" à : {summary}" if summary else " à votre recherche"
+        if found.results:
+            shown = len(found.results)
+            plural = "s" if found.total > 1 else ""
+            reply = (f"J'ai trouvé {found.total} annonce{plural} publiée{plural}" + (f" pour : {summary}." if summary else ".")
+                     + (f" Voici les {shown} plus pertinentes." if found.total > shown else ""))
+        elif found.alternatives:
+            reply = (f"Aucune annonce publiée ne correspond exactement{target}. "
+                     f"En élargissant ({', '.join(found.relaxed)}), voici {len(found.alternatives)} annonce"
+                     f"{'s' if len(found.alternatives) > 1 else ''} proche{'s' if len(found.alternatives) > 1 else ''}.")
         else:
-            reply = f"Aucune annonce publiée ne correspond pour l'instant à : {summary}. Essayez d'élargir le budget ou le quartier."
+            reply = f"Aucune annonce publiée ne correspond{target}, même en élargissant les critères."
+            if found.lowest_price:
+                reply += f" Pour ce type de recherche, la moins chère actuellement publiée est à {_fmt_price(found.lowest_price)}."
+            reply += " Vous pouvez modifier le budget, la ville ou le type de bien."
+        reply += _mismatch_note(found, merged)
+        if rules.get("_ambiguous_transaction") and not merged.get("transaction_type"):
+            reply += " Souhaitez-vous louer ou acheter ? Précisez-le pour affiner."
         if mode == "fallback":
             reply += " (Assistant IA momentanément indisponible : analyse simplifiée de votre demande.)"
 
@@ -179,13 +275,16 @@ def handle_message(*, user, anon_key: str, text: str, conversation_id=None) -> d
         conversation.save(update_fields=["last_criteria", "updated_at"])
         Message.objects.create(
             conversation=conversation, role="assistant", text=reply, criteria=merged, mode=mode,
-            listing_ids=[str(listing.pk) for listing in results + alternatives],
+            listing_ids=[str(listing.pk) for listing in found.results + found.alternatives],
         )
-    return _payload(conversation, reply, merged, results, alternatives, mode, remaining)
+    return _payload(conversation, reply, merged, found.results, found.alternatives, mode, remaining,
+                    total=found.total, relaxed=found.relaxed)
 
 
-def _payload(conversation, reply, criteria, results, alternatives, mode, remaining):
+def _payload(conversation, reply, criteria, results, alternatives, mode, remaining, *, total=None, relaxed=None):
     return {
+        "total": len(results) if total is None else total,
+        "relaxed": relaxed or [],
         "conversation_id": str(conversation.pk),
         "reply": reply,
         "criteria": criteria,
