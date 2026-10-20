@@ -244,3 +244,17 @@ def test_production_email_defaults_to_smtp_and_is_disabled_without_host():
 )
 def test_production_refuses_unsafe_email_configuration(override, fragment):
     assert_refused(run(STORAGE_PROBE, {**PROD_OK, **override}), fragment)
+
+
+def test_railway_healthcheck_is_allowed_and_not_redirected():
+    probe = (
+        "import django; from django.conf import settings; django.setup(); "
+        "from django.test import Client; c = Client(); "
+        "r = c.get('/health/', HTTP_HOST='healthcheck.railway.app'); "
+        "r2 = c.get('/api/v1/assistant/info/', HTTP_HOST='healthcheck.railway.app'); "
+        "print(r.status_code, r2.status_code, 'healthcheck.railway.app' in settings.ALLOWED_HOSTS)"
+    )
+    result = run(probe, PROD_OK)
+    assert result.returncode == 0, result.stderr[-800:]
+    # /health/ répond 200 en HTTP ; le reste du site reste redirigé vers HTTPS.
+    assert result.stdout.split()[-3:] == ["200", "301", "True"]

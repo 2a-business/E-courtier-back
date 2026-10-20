@@ -3,7 +3,14 @@ from rest_framework import serializers
 from apps.listings.serializers import ListingCardSerializer
 
 from . import services
-from .models import ApplicationDocument, ApplicationDocumentType, ApplicationEvent, ApplicationNote, RentalApplication
+from .models import (
+    ApplicationDocument,
+    ApplicationDocumentType,
+    ApplicationEvent,
+    ApplicationFeePayment,
+    ApplicationNote,
+    RentalApplication,
+)
 
 
 class ApplicationDocumentSerializer(serializers.ModelSerializer):
@@ -66,16 +73,26 @@ class ApplicationDetailSerializer(ApplicationListSerializer):
     my_role = serializers.SerializerMethodField()
     internal_notes = serializers.SerializerMethodField()
     can_edit = serializers.SerializerMethodField()
+    responsible = serializers.SerializerMethodField()
+    visit_starts_at = serializers.DateTimeField(source="visit.slot.starts_at", read_only=True)
 
     class Meta(ApplicationListSerializer.Meta):
         fields = ApplicationListSerializer.Meta.fields + [
             "profession", "employer", "monthly_income_xof", "household_size", "move_in_date", "has_guarantor",
             "guarantor_name", "message", "consent_accepted_at", "first_submitted_at", "info_request_message",
             "decision_reason", "documents", "events", "requirements", "payment", "my_role", "internal_notes", "can_edit",
+            "responsible", "visit_starts_at",
         ]
 
     def _role(self, obj):
         return services.role_for(self.context["request"].user, obj)
+
+    def get_responsible(self, obj) -> dict:
+        """Destinataire du dossier, déduit de l'annonce (jamais d'un identifiant fourni par le client) ; sans coordonnées."""
+        owner = obj.listing.owner
+        profile = getattr(owner, "profile", None)
+        return {"name": owner.public_name, "role": owner.role, "role_label": owner.get_role_display(),
+                "agency_name": getattr(profile, "agency_name", "") or ""}
 
     def get_requirements(self, obj) -> dict:
         return services.requirements(obj)
@@ -135,3 +152,34 @@ class ApplicationDecisionSerializer(serializers.Serializer):
 
 class NoteSerializer(serializers.Serializer):
     text = serializers.CharField(max_length=2000)
+
+
+class FeeDeclareSerializer(serializers.Serializer):
+    provider_reference = serializers.RegexField(r"^[A-Za-z0-9_\-]{6,64}$", error_messages={"invalid": "Référence Wave invalide."})
+
+
+class AdminFeeConfirmSerializer(serializers.Serializer):
+    provider_reference = serializers.RegexField(r"^[A-Za-z0-9_\-]{6,64}$", error_messages={"invalid": "Référence Wave invalide."})
+    note = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
+
+
+class AdminFeeRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=300)
+
+
+class AdminFeePaymentSerializer(serializers.ModelSerializer):
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    reference = serializers.CharField(read_only=True)
+    application_id = serializers.UUIDField(source="application.id", read_only=True)
+    application_status = serializers.CharField(source="application.status", read_only=True)
+    listing_title = serializers.CharField(source="application.listing.title", read_only=True)
+    customer_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApplicationFeePayment
+        fields = ["id", "amount", "currency", "status", "status_label", "reference", "provider_reference", "checkout_started_at",
+                  "declared_at", "confirmed_at", "failure_reason", "application_id", "application_status", "listing_title",
+                  "customer_name", "created_at"]
+
+    def get_customer_name(self, obj) -> str:
+        return obj.application.customer.full_name

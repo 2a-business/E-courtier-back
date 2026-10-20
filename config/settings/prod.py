@@ -57,8 +57,10 @@ if (_db.get("HOST") or "") not in ("localhost", "127.0.0.1", ""):
 # --- Paiement -----------------------------------------------------------------------
 # La simulation de paiement ne doit jamais être active sur un environnement réel.
 _require(not PAYMENT_SIMULATION_ENABLED, "PAYMENT_SIMULATION_ENABLED doit être false en production.")  # noqa: F405
-if WAVE_PAYMENT_LINK:  # noqa: F405
-    _require(urlparse(WAVE_PAYMENT_LINK).scheme == "https", "WAVE_PAYMENT_LINK doit être une URL https://.")  # noqa: F405
+for _name in ("WAVE_PAYMENT_LINK", "WAVE_DOSSIER_FEE_LINK"):
+    _link = (env(_name) or "").strip()
+    if _link:
+        _require(urlparse(_link).scheme == "https", f"{_name} doit être une URL https://.")
 
 # --- Fichiers -----------------------------------------------------------------------
 # Seuls les sous-dossiers publics (listings/) de MEDIA_ROOT sont diffusés. Les justificatifs peuvent vivre sur le
@@ -100,6 +102,10 @@ if EMAIL_ENABLED:
 # --- HTTPS et cookies ---------------------------------------------------------------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)
+# Healthcheck Railway : requête interne en HTTP avec l'hôte healthcheck.railway.app ; seul un 2xx est accepté.
+# Sans ces deux réglages, la sonde recevrait 400 (hôte refusé) ou 301 (redirection HTTPS) et tout déploiement échouerait.
+SECURE_REDIRECT_EXEMPT = [r"^health/"]
+ALLOWED_HOSTS = [*ALLOWED_HOSTS, "healthcheck.railway.app"]  # noqa: F405
 SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 60 * 60 * 24 * 30)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_CONTENT_TYPE_NOSNIFF = True

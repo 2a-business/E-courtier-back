@@ -58,6 +58,16 @@ def submitted_app(customer, ready_app):
     return ready_app
 
 
+def confirm_fee(app_id, admin, reference="T_FRAIS00001"):
+    """Rapprochement manuel des frais par un administrateur (aucun paiement réel)."""
+    from apps.applications.models import ApplicationFeePayment
+
+    fee = ApplicationFeePayment.objects.get(application_id=app_id)
+    res = client_for(admin).post(f"/api/v1/admin/application-fees/{fee.pk}/confirm/", {"provider_reference": reference}, format="json")
+    assert res.status_code == 200, res.data
+    return fee
+
+
 # --- Ouverture ------------------------------------------------------------------------
 
 
@@ -84,6 +94,10 @@ def test_open_is_idempotent_and_starts_incomplete(customer, visit):
     assert data["status"] == "DRAFT" and data["state"] == "INCOMPLETE" and data["my_role"] == "customer"
     assert data["requirements"]["missing_documents"] == ["Carte nationale d'identité ou Passeport"]
     assert data["internal_notes"] is None and data["can_edit"] is True
+    # Destinataire déduit de l'annonce, sans coordonnées ; visite retrouvée automatiquement.
+    assert data["responsible"]["name"] == visit.listing.owner.public_name and data["responsible"]["role"] == "OWNER"
+    assert "email" not in data["responsible"] and "phone" not in data["responsible"]
+    assert data["visit"] == visit.pk and data["visit_starts_at"]
 
 
 def test_draft_is_invisible_to_owner(listing, customer, visit):
@@ -243,9 +257,13 @@ def test_accept_and_reject_transitions_and_history(listing, customer, submitted_
     assert owner.post(f"{URL}{submitted_app}/review/").data["status"] == "UNDER_REVIEW"
     res = owner.post(f"{URL}{submitted_app}/decision/", {"decision": "REJECTED", "reason": ""}, format="json")
     assert res.status_code == 400 and res.data["code"] == "reason_required"
+    # Frais de dossier non confirmés : acceptation bloquée.
+    res = owner.post(f"{URL}{submitted_app}/decision/", {"decision": "ACCEPTED"}, format="json")
+    assert res.status_code == 409 and res.data["code"] == "fee_not_confirmed"
+    confirm_fee(submitted_app, admin)
     res = owner.post(f"{URL}{submitted_app}/decision/", {"decision": "ACCEPTED"}, format="json")
     assert res.status_code == 200 and res.data["status"] == "ACCEPTED" and res.data["decided_at"]
-    assert [e["event"] for e in res.data["events"]] == ["created", "submitted", "review_started", "accepted"]
+    assert [e["event"] for e in res.data["events"]] == ["created", "submitted", "review_started", "fee_payment_confirmed", "accepted"]
     assert Notification.objects.filter(user=customer, kind="application.accepted").count() == 1
     again = owner.post(f"{URL}{submitted_app}/decision/", {"decision": "REJECTED", "reason": "x"}, format="json")
     assert again.status_code == 409
@@ -272,12 +290,15 @@ def test_internal_notes_hidden_from_candidate(listing, customer, submitted_app, 
 # --- Paiement (lecture seule) ---------------------------------------------------------
 
 
-def test_payment_not_configured_shows_no_false_confirmation(customer, listing, submitted_app):
-    with override_settings(WAVE_PAYMENT_LINK=""):
+def test_payment_not_configured_shows_no_false_confirmation(customer, listing, submitted_app, admin):
+    with override_settings(WAVE_PAYMENT_LINK="", WAVE_DOSSIER_FEE_LINK=""):
         payment = client_for(customer).get(f"{URL}{submitted_app}/").data["payment"]
-    assert payment == {"fee_amount": settings.DOSSIER_FEE_XOF, "currency": "XOF", "wave_configured": False, "transaction": None}
+    assert payment["fee_amount"] == settings.DOSSIER_FEE_XOF and payment["wave_configured"] is False and payment["transaction"] is None
+    assert payment["fee"]["status"] == "PENDING" and payment["fee"]["can_pay"] is False
+    assert payment["fee"]["payment_problem"] == "Le paiement Wave n'est pas configuré sur cet environnement."
+    confirm_fee(submitted_app, admin)
     client_for(listing.owner).post(f"{URL}{submitted_app}/decision/", {"decision": "ACCEPTED"}, format="json")
-    # Accepter le dossier ne crée ni ne confirme aucun paiement.
+    # Accepter le dossier ne crée ni ne confirme aucun paiement de loyer.
     assert client_for(customer).get(f"{URL}{submitted_app}/").data["payment"]["transaction"] is None
 
 

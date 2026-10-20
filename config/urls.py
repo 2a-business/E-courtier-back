@@ -7,6 +7,7 @@ from django.urls import include, path, re_path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 from apps.accounts import urls as accounts_urls
+from apps.applications import urls as applications_urls
 from apps.assistant import urls as assistant_urls
 from apps.listings import urls as listings_urls
 from apps.listings.views import AmenityListView
@@ -20,6 +21,25 @@ def health(request):
     return JsonResponse({"status": "ok"})
 
 
+def ready(request):
+    """Prêt à servir : base joignable et toutes les migrations appliquées (healthcheck Railway recommandé).
+
+    Une migration oubliée (ex. table du dossier locatif absente) fait échouer le healthcheck : Railway conserve alors
+    l'ancien déploiement au lieu de servir des erreurs 500. Seul le nombre de migrations manquantes est exposé.
+    """
+    from django.db import DatabaseError, connection
+    from django.db.migrations.executor import MigrationExecutor
+
+    try:
+        executor = MigrationExecutor(connection)
+        pending = executor.migration_plan(executor.loader.graph.leaf_nodes())
+    except DatabaseError:
+        return JsonResponse({"status": "database_unavailable"}, status=503)
+    if pending:
+        return JsonResponse({"status": "migrations_pending", "pending": len(pending)}, status=503)
+    return JsonResponse({"status": "ready"})
+
+
 admin_api = (
     accounts_urls.admin_urlpatterns
     + listings_urls.admin_urlpatterns
@@ -28,6 +48,7 @@ admin_api = (
     + reviews_urls.admin_urlpatterns
     + moderation_urls.admin_urlpatterns
     + assistant_urls.admin_urlpatterns
+    + applications_urls.admin_urlpatterns
 )
 
 api_v1 = [
@@ -38,7 +59,7 @@ api_v1 = [
     path("verification/", include(verification_urls.urlpatterns)),
     path("assistant/", include(assistant_urls.urlpatterns)),
     path("visits/", include("apps.visits.urls")),
-    path("applications/", include("apps.applications.urls")),
+    path("applications/", include(applications_urls.urlpatterns)),
     path("transactions/", include(transactions_urls.urlpatterns)),
     path("contracts/", include("apps.contracts.urls")),
     path("reviews/", include(reviews_urls.urlpatterns)),
@@ -52,6 +73,7 @@ api_v1 = [
 urlpatterns = [
     path("api/v1/", include(api_v1)),
     path("health/", health),
+    path("health/ready/", ready),
     # Interface d'administration Django (secours technique), séparée de l'espace /admin du frontend.
     path("django-admin/", admin.site.urls),
 ]

@@ -19,17 +19,20 @@ from apps.listings.models import TransactionType
 from apps.media.files import delete_after_commit
 from apps.moderation.services import log_action
 from apps.notifications.services import notify
-from apps.transactions.models import Transaction, TransactionStatus
+from apps.transactions import providers as wave
+from apps.transactions.models import PaymentAttempt, Provider, Transaction, TransactionStatus
 from apps.verification import files
 from apps.visits.models import Visit, VisitStatus
 
 from .models import (
     EDITABLE_STATUSES,
     ApplicationDocument,
+    ApplicationFeePayment,
     ApplicationDocumentType,
     ApplicationEvent,
     ApplicationNote,
     ApplicationStatus,
+    FeePaymentStatus,
     RentalApplication,
 )
 
@@ -107,6 +110,8 @@ def requirements(app: RentalApplication) -> dict:
         "missing_documents": missing_documents,
         "missing_fields": missing_fields,
         "is_complete": not missing_documents and not missing_fields,
+        "accepted_formats": ["PDF", "JPEG", "PNG"],
+        "max_document_size_mb": settings.MAX_DOCUMENT_SIZE_MB,
     }
 
 
@@ -117,18 +122,47 @@ def display_state(app: RentalApplication, reqs: dict | None = None) -> str:
     return app.status
 
 
+def fee_summary(app: RentalApplication) -> dict:
+    """État réel des frais de dossier (jamais déduit d'un clic, d'un retour de Wave ou d'une déclaration)."""
+    fee = getattr(app, "fee_payment", None) if app.pk else None
+    amount = fee.amount if fee else settings.DOSSIER_FEE_XOF
+    if amount <= 0:
+        return {"status": "NOT_REQUIRED", "status_label": "Aucun frais de dossier", "amount": 0, "currency": "XOF",
+                "reference": None, "provider_reference": "", "declared_at": None, "confirmed_at": None,
+                "failure_reason": "", "can_pay": False, "payment_problem": None, "started": False}
+    problem = wave.link_problem(wave.dossier_fee_link(), amount)
+    status = fee.status if fee else "NOT_STARTED"
+    payable_app = app.status in (S.SUBMITTED, S.UNDER_REVIEW, S.INFO_REQUESTED)
+    payable_fee = status in (FeePaymentStatus.PENDING, FeePaymentStatus.AWAITING_VERIFICATION, FeePaymentStatus.FAILED)
+    return {
+        "status": status,
+        "status_label": fee.get_status_display() if fee else "Dû après la transmission du dossier",
+        "amount": amount, "currency": "XOF",
+        "reference": fee.reference if fee else None,
+        "provider_reference": fee.provider_reference if fee else "",
+        "declared_at": fee.declared_at if fee else None,
+        "confirmed_at": fee.confirmed_at if fee else None,
+        "failure_reason": fee.failure_reason if fee else "",
+        "started": bool(fee and fee.checkout_started_at),
+        "can_pay": payable_app and payable_fee and problem is None,
+        "payment_problem": problem if payable_app and payable_fee else None,
+    }
+
+
 def payment_summary(app: RentalApplication) -> dict:
-    """État réel du paiement (Transaction) pour ce logement et ce candidat — lecture seule."""
+    """Frais de dossier (payés via le dossier) et paiement du premier loyer (Transaction), en lecture seule."""
     tx = (
         Transaction.objects.filter(listing_id=app.listing_id, customer_id=app.customer_id)
         .exclude(status=TransactionStatus.CANCELLED)
         .order_by("-created_at")
         .first()
     )
+    fee = fee_summary(app)
     return {
-        "fee_amount": settings.DOSSIER_FEE_XOF,
+        "fee_amount": fee["amount"],
         "currency": "XOF",
         "wave_configured": bool(settings.WAVE_PAYMENT_LINK),
+        "fee": fee,
         "transaction": None if tx is None else {
             "id": str(tx.pk), "reference": tx.reference, "status": tx.status, "status_label": tx.get_status_display(),
             "total_amount": tx.total_amount, "fee_amount": tx.fee_amount, "is_simulated": tx.is_simulated,
@@ -255,6 +289,9 @@ def submit(*, actor, app: RentalApplication, consent: bool) -> RentalApplication
     app.first_submitted_at = app.first_submitted_at or now
     app.save()
     app.documents.filter(submitted_at__isnull=True).update(submitted_at=now)
+    if settings.DOSSIER_FEE_XOF > 0:
+        # Montant figé côté serveur à la première transmission ; jamais fourni par le client.
+        ApplicationFeePayment.objects.get_or_create(application=app, defaults={"amount": settings.DOSSIER_FEE_XOF})
     _event(app, "resubmitted" if resubmission else "submitted", actor=actor, from_status=previous, to_status=S.SUBMITTED)
     log_action(actor=actor, action="application.submitted", target=app, metadata={"listing": str(app.listing_id)})
     title = app.listing.title
@@ -320,7 +357,16 @@ def decide(*, actor, app: RentalApplication, decision: str, reason: str = "") ->
     reason = reason.strip()
     if decision == S.REJECTED and not reason:
         raise BusinessError("Un motif est obligatoire pour refuser un dossier.", code="reason_required")
+    fee = ApplicationFeePayment.objects.select_for_update().filter(application=app).first()
+    if decision == S.ACCEPTED and fee is not None and fee.status != FeePaymentStatus.CONFIRMED:
+        raise BusinessError(
+            "Le dossier ne peut être accepté qu'après la confirmation des frais de dossier par E-Courtier.",
+            code="fee_not_confirmed", http_status=409,
+        )
     previous = _transition(app, decision)
+    if decision == S.REJECTED and fee is not None and fee.status not in (FeePaymentStatus.CONFIRMED, FeePaymentStatus.CANCELLED):
+        fee.status = FeePaymentStatus.CANCELLED
+        fee.save(update_fields=["status", "updated_at"])
     app.decided_at = timezone.now()
     app.decided_by = actor
     app.decision_reason = reason[:1000]
@@ -351,3 +397,112 @@ def record_document_view(*, actor, document: ApplicationDocument, role: str) -> 
     if role in ("responsible", "admin"):
         log_action(actor=actor, action="application.document_viewed", target=document,
                    metadata={"application": str(document.application_id), "role": role})
+
+
+# --- Frais de dossier (lien Wave Business, rapprochement manuel) ----------------------
+
+
+def _fee_for_update(app: RentalApplication) -> ApplicationFeePayment:
+    fee = ApplicationFeePayment.objects.select_for_update().select_related("application__listing", "application__customer").filter(application=app).first()
+    if fee is None:
+        raise BusinessError("Aucun frais de dossier n'est dû pour ce dossier.", code="fee_not_required", http_status=409)
+    return fee
+
+
+def _reference_taken(reference: str, *, exclude_fee=None) -> bool:
+    """Une référence Wave ne peut justifier qu'un seul paiement, frais ou loyer."""
+    fees = ApplicationFeePayment.objects.filter(provider_reference=reference)
+    if exclude_fee is not None:
+        fees = fees.exclude(pk=exclude_fee.pk)
+    return fees.exists() or PaymentAttempt.objects.filter(provider=Provider.WAVE_LINK, provider_reference=reference).exists()
+
+
+@transaction.atomic
+def start_fee_payment(*, actor, app: RentalApplication) -> tuple[ApplicationFeePayment, dict]:
+    app = RentalApplication.objects.select_for_update().get(pk=app.pk)
+    ensure_role(actor, app, "customer")
+    if app.status not in (S.SUBMITTED, S.UNDER_REVIEW, S.INFO_REQUESTED):
+        raise InvalidTransition("Les frais de dossier se règlent après la transmission du dossier.")
+    fee = _fee_for_update(app)
+    if fee.status in (FeePaymentStatus.CONFIRMED, FeePaymentStatus.CANCELLED):
+        raise InvalidTransition(f"Paiement impossible : {fee.get_status_display().lower()}.")
+    checkout = wave.checkout(wave.dossier_fee_link(), amount=fee.amount, reference=fee.reference)  # 503 si lien absent/incohérent
+    if fee.checkout_started_at is None:  # idempotent : un seul évènement, quel que soit le nombre de clics
+        fee.checkout_started_at = timezone.now()
+        fee.save(update_fields=["checkout_started_at", "updated_at"])
+        _event(app, "fee_payment_started", actor=actor, note=f"Redirection vers Wave ({fee.amount} FCFA)")
+    return fee, {"url": checkout.url, "instructions": checkout.instructions, "auto_confirmation": False,
+                 "amount": fee.amount, "reference": fee.reference}
+
+
+@transaction.atomic
+def declare_fee_payment(*, actor, app: RentalApplication, provider_reference: str) -> ApplicationFeePayment:
+    app = RentalApplication.objects.select_for_update().get(pk=app.pk)
+    ensure_role(actor, app, "customer")
+    fee = _fee_for_update(app)
+    if fee.checkout_started_at is None:
+        raise BusinessError("Ouvrez d'abord le paiement Wave depuis E-Courtier.", code="payment_not_started", http_status=409)
+    if fee.status not in (FeePaymentStatus.PENDING, FeePaymentStatus.AWAITING_VERIFICATION, FeePaymentStatus.FAILED):
+        raise InvalidTransition(f"Déclaration impossible : {fee.get_status_display().lower()}.")
+    reference = provider_reference.strip().upper()
+    if _reference_taken(reference, exclude_fee=fee):
+        raise BusinessError("Cette référence Wave est déjà associée à un autre paiement.", code="duplicate_reference", http_status=409)
+    fee.provider_reference = reference
+    fee.status = FeePaymentStatus.AWAITING_VERIFICATION
+    fee.declared_at = timezone.now()
+    fee.failure_reason = ""
+    fee.save()
+    _event(app, "fee_payment_declared", actor=actor, note=f"Référence déclarée : {reference}")
+    return fee
+
+
+@transaction.atomic
+def confirm_fee_payment(*, actor, fee: ApplicationFeePayment, provider_reference: str, note: str = "") -> ApplicationFeePayment:
+    """Rapprochement manuel par un administrateur, après vérification dans Wave Business (montant et référence)."""
+    if not (actor and actor.is_admin):
+        raise Forbidden("Seul un administrateur peut confirmer un paiement.")
+    fee = ApplicationFeePayment.objects.select_for_update().select_related("application__listing", "application__customer").get(pk=fee.pk)
+    if fee.status == FeePaymentStatus.CONFIRMED:
+        raise InvalidTransition("Ces frais sont déjà confirmés.")
+    if fee.status == FeePaymentStatus.CANCELLED:
+        raise InvalidTransition("Ces frais ont été annulés (dossier refusé).")
+    reference = provider_reference.strip().upper()
+    if not reference:
+        raise BusinessError("La référence Wave vérifiée est obligatoire.", code="reference_required")
+    if _reference_taken(reference, exclude_fee=fee):
+        raise BusinessError("Cette référence Wave est déjà associée à un autre paiement.", code="duplicate_reference", http_status=409)
+    fee.provider_reference = reference
+    fee.status = FeePaymentStatus.CONFIRMED
+    fee.confirmed_at = timezone.now()
+    fee.confirmed_by = actor
+    fee.failure_reason = ""
+    fee.save()
+    app = fee.application
+    _event(app, "fee_payment_confirmed", actor=actor, note=note or f"Rapproché avec la transaction Wave {reference}")
+    log_action(actor=actor, action="application.fee_confirmed", target=fee, metadata={"application": str(app.pk), "amount": fee.amount})
+    for user in (app.customer, app.listing.owner):
+        notify(user, kind="application.fee_confirmed", title="Frais de dossier confirmés",
+               body=f"« {app.listing.title} » : frais de dossier de {fee.amount} FCFA vérifiés par E-Courtier.", link=f"/dossiers/{app.pk}")
+    return fee
+
+
+@transaction.atomic
+def reject_fee_payment(*, actor, fee: ApplicationFeePayment, reason: str) -> ApplicationFeePayment:
+    if not (actor and actor.is_admin):
+        raise Forbidden("Seul un administrateur peut statuer sur un paiement.")
+    fee = ApplicationFeePayment.objects.select_for_update().select_related("application__listing", "application__customer").get(pk=fee.pk)
+    if fee.status != FeePaymentStatus.AWAITING_VERIFICATION:
+        raise InvalidTransition("Seul un paiement en attente de vérification peut être déclaré non retrouvé.")
+    reason = reason.strip()
+    if not reason:
+        raise BusinessError("Un motif est obligatoire.", code="reason_required")
+    fee.status = FeePaymentStatus.FAILED
+    fee.failure_reason = reason[:300]
+    fee.save(update_fields=["status", "failure_reason", "updated_at"])
+    app = fee.application
+    _event(app, "fee_payment_failed", actor=actor, note=reason)
+    log_action(actor=actor, action="application.fee_failed", target=fee, metadata={"application": str(app.pk)})
+    notify(app.customer, kind="application.fee_failed", title="Paiement des frais non retrouvé",
+           body=f"« {app.listing.title} » : {reason[:200]} Vous pouvez déclarer une autre référence Wave.", link=f"/dossiers/{app.pk}")
+    return fee
+
